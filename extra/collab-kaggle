@@ -1,0 +1,158 @@
+# HOST CODER AI
+import os
+import subprocess
+import threading
+import time
+import re
+import requests
+from tqdm import tqdm
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+URL_MODELO = "https://huggingface.co/yuxinlu1/gemma-4-12B-coder-fable5-composer2.5-v1-GGUF/resolve/main/gemma4-coding-Q8_0.gguf"
+MODEL_FILENAME = "gemma4-coding-Q8_0.gguf"
+KAGGLE_CACHE = "/kaggle/working/llama_cache"
+MODEL_PATH = os.path.join(KAGGLE_CACHE, MODEL_FILENAME)
+
+os.makedirs(KAGGLE_CACHE, exist_ok=True)
+
+# ============================================================
+# 1. Instalación y Descarga (Barra Estática con Reanudación)
+# ============================================================
+def setup_python_env():
+    print("\n📦 Paso 1: Instalando dependencias del servidor (binarios precompilados)...")
+    
+    # Instalamos dependencias generales primero
+    subprocess.run("pip install fastapi uvicorn pydantic-settings requests tqdm -q", shell=True)
+    
+    # Forzamos el uso del wheel precompilado para CUDA 12.1 y evitamos la compilación local
+    install_cmd = "pip install llama-cpp-python[server] --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 --prefer-binary -q"
+    result = subprocess.run(install_cmd, shell=True)
+    
+    if result.returncode != 0:
+        raise RuntimeError("Falló la instalación de llama-cpp-python. El entorno de Kaggle podría requerir reiniciar la sesión.")
+
+    print(f"\n📥 Paso 2: Descargando modelo de forma silenciosa...")
+    
+    headers = {}
+    modo_apertura = 'wb'
+    descargado = 0
+    
+    if os.path.exists(MODEL_PATH):
+        descargado = os.path.getsize(MODEL_PATH)
+        headers['Range'] = f'bytes={descargado}-'
+        modo_apertura = 'ab'
+
+    response = requests.get(URL_MODELO, stream=True, headers=headers)
+    
+    if response.status_code == 416:
+        print("✅ El modelo ya está completamente descargado.")
+    elif response.status_code in [200, 206]:
+        total_size = int(response.headers.get('content-length', 0)) + descargado
+        
+        with open(MODEL_PATH, modo_apertura) as file, tqdm(
+            desc="Descarga",
+            total=total_size,
+            initial=descargado,
+
+            unit='iB',
+            unit_scale=True,
+            unit_divisor=1024,
+            leave=True,
+            ncols=80,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]'
+        ) as bar:
+            for data in response.iter_content(chunk_size=1024*1024):
+                size = file.write(data)
+                bar.update(size)
+                
+        file_size = os.path.getsize(MODEL_PATH) / (1024**3)
+        print(f"\n✅ Descarga finalizada. Tamaño en disco: {file_size:.2f} GB")
+    else:
+        raise RuntimeError(f"Error HTTP {response.status_code} al contactar Hugging Face.")
+
+# ============================================================
+# 2. Iniciar Servidor Llama-Python
+# ============================================================
+def start_python_server():
+    print(f"\n🚀 Paso 3: Cargando modelo en VRAM (GPU T4x2)...")
+    cmd = [
+        "python", "-m", "llama_cpp.server",
+        "--model", MODEL_PATH,
+        "--n_ctx", "16384",
+        "--n_gpu_layers", "99",
+        "--host", "0.0.0.0",
+        "--port", "11434"
+    ]
+    
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    
+    server_ready = False
+    timeout = 120
+    start_time = time.time()
+
+    for line in proc.stdout:
+        if "Uvicorn running on" in line or "11434" in line or "Application startup complete" in line:
+            server_ready = True
+            break
+            
+        if time.time() - start_time > timeout:
+            raise RuntimeError("Tiempo de espera agotado al arrancar el servidor.")
+            
+    if not server_ready:
+        raise RuntimeError("El servidor no pudo iniciar. Revisa los logs.")
+        
+    def drain():
+        for _ in proc.stdout: pass
+    threading.Thread(target=drain, daemon=True).start()
+    return proc
+
+# ============================================================
+# 3. Túnel Cloudflare (Acceso Externo)
+# ============================================================
+def start_cloudflare_tunnel():
+    print("\n☁️ Paso 4: Abriendo túnel seguro con Cloudflare...")
+    if not os.path.exists("cloudflared"):
+        os.system("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared")
+        os.system("chmod +x cloudflared")
+    
+    proc = subprocess.Popen(["./cloudflared", "tunnel", "--url", "http://127.0.0.1:11434"],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    url = None
+    start_time = time.time()
+    
+    for line in proc.stdout:
+        if "trycloudflare.com" in line:
+            match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
+            if match:
+                url = match.group(0)
+                break
+                
+        if time.time() - start_time > 30:
+            break
+            
+    if not url:
+        print("\n⚠️ Advertencia: Cloudflare no devolvió una URL. Es posible que hayan bloqueado el túnel gratuito.")
+    return url
+
+# ============================================================
+# EJECUCIÓN
+# ============================================================
+try:
+    setup_python_env()
+    server = start_python_server()
+    public_url = start_cloudflare_tunnel()
+    
+    print("\n" + "="*65)
+    print(f"✅ SERVIDOR 100% OPERATIVO")
+    if public_url:
+        print(f"🔗 URL PARA TU SCRIPT LOCAL:")
+        print(f"   {public_url}/v1")
+    else:
+        print("❌ Cloudflare falló. Usa un túnel alternativo como localtunnel o ngrok.")
+    print("="*65)
+    
+    while True: time.sleep(60)
+except Exception as e:
+    print(f"\n💥 Error Crítico: {e}")
